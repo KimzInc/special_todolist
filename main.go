@@ -1,76 +1,77 @@
 package main
 
 import (
+	"errors"
+	"log"
 	"net/http"
-	"sync"
 
 	"github.com/gin-gonic/gin"
 )
 
-// task represents data about a task
-type task struct {
-	TaskID      string `json:"task_id"`
-	Title       string `json:"title"`
-	Description string `json:"description"`
-	IsCompleted bool   `json:"is_completed"`
+//server holds the dependencies the handlers need. It depends on the
+// TaskStore interface, never on a concrete type.
+type server struct{
+	store TaskStore
 }
-
-// tasks slice to seed task data
-var tasks = []task{
-	{TaskID: "1", Title: "Buy groceries", Description: "Go to the market and buy all weeks groceries", IsCompleted: false},
-	{TaskID: "2", Title: "Pancakes", Description: "Prepare pancakes using EX home baking flour", IsCompleted: false},
-	{TaskID: "3", Title: "Chapter 7 Interfaces", Description: "Read the whole of chapter 7 of idiomatic Go interfaces", IsCompleted: false},
-}
-
-// mu guards tasks. It must be shared by every handler.
-var mu sync.RWMutex
 
 func main() {
+	srv := &server{store: NewMemoryStore()}
+
 	router := gin.Default()
-	router.GET("/tasks/:id", getTaskByID)
-	router.GET("/tasks", getAllTasks)
-	router.POST("/tasks", postTask)
+	router.GET("/tasks/:id", srv.getTaskByID)
+	router.GET("/tasks", srv.getAllTasks)
+	router.POST("/tasks", srv.postTask)
 
-	router.Run("localhost:8080")
+	if err := router.Run("localhost:8080"); err != nil {
+		log.Fatal(err)
+	}
 }
 
-// getAllTasks responds with the list of all tasks as JSON
-func getAllTasks(c *gin.Context) {
-	mu.RLock()
-	snapshot := make([]task, len(tasks))
-	copy(snapshot, tasks)
-	mu.RUnlock()
 
-	c.IndentedJSON(http.StatusOK, snapshot)
+// getAllTask responds with the list of all tasks as JSON.
+func (s *server) getAllTasks(c *gin.Context){
+	tasks, err := s.store.List(c.Request.Context())
+
+	if err != nil {
+		log.Printf("list tasks: %v", err)
+		c.IndentedJSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+		return
+	}
+	c.IndentedJSON(http.StatusOK, tasks)
 }
 
-// getTaskByID locates the task whose ID matches the id parameter
-func getTaskByID(c *gin.Context) {
-	id := c.Param("id")
 
-	mu.RLock()
-	defer mu.RUnlock()
-
-	for _, t := range tasks {
-		if t.TaskID == id {
-			c.IndentedJSON(http.StatusOK, t)
+// getTaskByID responds with the task whose ID matches the id parameter.
+func (s *server) getTaskByID(c *gin.Context) {
+	t, err := s.store.Get(c.Request.Context(), c.Param("id"))
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			c.IndentedJSON(http.StatusNotFound, gin.H{"message": "task not found"})
 			return
 		}
+		log.Printf("get task: %v", err)
+		c.IndentedJSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+		return
 	}
-	c.IndentedJSON(http.StatusNotFound, gin.H{"message": "task not found"})
+	c.IndentedJSON(http.StatusOK, t)
 }
-
-// postTask adds a task from the JSON in the request body
-func postTask(c *gin.Context) {
-	var newTask task
+ 
+// postTask adds a task from the JSON in the request body.
+func (s *server) postTask(c *gin.Context) {
+	var newTask Task
 	if err := c.ShouldBindJSON(&newTask); err != nil {
 		c.IndentedJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-
-	mu.Lock()
-	tasks = append(tasks, newTask)
-	mu.Unlock()
-
+ 
+	if err := s.store.Add(c.Request.Context(), newTask); err != nil {
+		if errors.Is(err, ErrDuplicate) {
+			c.IndentedJSON(http.StatusConflict, gin.H{"error": "task_id already exists"})
+			return
+		}
+		log.Printf("add task: %v", err)
+		c.IndentedJSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+		return
+	}
 	c.IndentedJSON(http.StatusCreated, newTask)
 }
